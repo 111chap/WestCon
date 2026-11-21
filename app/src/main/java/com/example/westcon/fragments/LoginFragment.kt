@@ -18,7 +18,7 @@ class LoginFragment : BaseFragment() {
                         clearBackStackAndNavigate(DashboardFragment())
                     } else {
                         val email = FirebaseManager.getCurrentUser()?.email ?: ""
-                        clearBackStackAndNavigate(SignUpStepTwoFragment.newInstance(email, ""))
+                        clearBackStackAndNavigate(SignUpStepTwoFragment.newInstance(email))
                     }
                 }
             },
@@ -26,3 +26,4 @@ class LoginFragment : BaseFragment() {
         )
     }
 }
+

@@ -41,7 +41,9 @@ fun RegisterScreen(onJoinClick: (String, String) -> Unit, onBackClick: () -> Uni
             val reloadResult = FirebaseManager.reloadUser()
             if (reloadResult.isSuccess && FirebaseManager.isEmailVerified()) {
                 isVerificationPending = false
-                onJoinClick(email, password) // Proceed automatically when verified
+                password = ""
+                confirmPassword = ""
+                onJoinClick(email, "")
             }
         }
     }
@@ -295,3 +297,4 @@ fun RegisterScreen(onJoinClick: (String, String) -> Unit, onBackClick: () -> Uni
         }
     }
 }
+

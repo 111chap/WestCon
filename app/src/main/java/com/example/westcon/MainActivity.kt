@@ -49,13 +49,16 @@ class MainActivity : FragmentActivity() {
 
             lifecycleScope.launch {
                 try {
+                    if (FirebaseManager.getCurrentUser() != null) {
+                        FirebaseManager.reloadUser().getOrThrow()
+                    }
                     val user = FirebaseManager.getCurrentUser()
                     val startFragment = if (user != null && FirebaseManager.isEmailVerified()) {
                         if (FirebaseManager.isProfileComplete(user.uid)) {
                             DashboardFragment()
                         } else {
                             // Logged in but profile not saved - redirect to Step Two
-                            SignUpStepTwoFragment.newInstance(user.email ?: "", "")
+                            SignUpStepTwoFragment.newInstance(user.email ?: "")
                         }
                     } else {
                         // If logged in but not verified, log out to be safe
@@ -82,3 +85,4 @@ class MainActivity : FragmentActivity() {
         }
     }
 }
+

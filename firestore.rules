@@ -1,0 +1,209 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function member() {
+      return request.auth != null && request.auth.token.email_verified == true
+        && request.auth.token.email.matches('^[^@]+@wvsu[.]edu[.]ph$');
+    }
+    function self(uid) { return member() && request.auth.uid == uid; }
+    function text(value, max) { return value is string && value.size() > 0 && value.size() <= max; }
+    function participant(e) { return member() && request.auth.uid in [e.requesterUid, e.responderUid]; }
+    function profile(uid) { return get(/databases/$(database)/documents/users/$(uid)).data; }
+    function chat(id) { return get(/databases/$(database)/documents/messages/$(id)).data; }
+    function chatAfter(id) { return getAfter(/databases/$(database)/documents/messages/$(id)).data; }
+    function validMessage(m, chatId) {
+      return member() && m.senderUid == request.auth.uid && m.receiverUid != request.auth.uid
+        && chatAfter(chatId).members.hasAll([m.senderUid, m.receiverUid])
+        && text(m.text, 4000) && m.timestamp == request.time
+        && m.isRead == false && m.read == false;
+    }
+    match /users/{uid} {
+      allow get, list: if member() && resource.data.email == '';
+      allow create, update: if self(uid) && request.resource.data.keys().hasOnly([
+        'uid','name','email','profileIconName','department','course','year','rating','swaps',
+        'about','skillsToTeach','skillsLearning','online','lastActive'])
+        && request.resource.data.uid == uid && request.resource.data.email == ''
+        && text(request.resource.data.name, 80) && request.resource.data.about is string
+        && request.resource.data.about.size() <= 2000
+        && request.resource.data.rating == 0 && request.resource.data.swaps == 0
+        && request.resource.data.skillsToTeach is list && request.resource.data.skillsToTeach.size() <= 30
+        && request.resource.data.skillsLearning is list && request.resource.data.skillsLearning.size() <= 30;
+      allow delete: if false;
+    }
+    match /skills/{id} {
+      allow read: if member();
+      allow create: if member() && request.resource.data.keys().hasOnly([
+        'id','authorUid','authorName','authorIconName','authorMastery','department','category','title','description','postType','anonymous','timestamp'])
+        && request.resource.data.id == id && request.resource.data.authorUid == request.auth.uid
+        && request.resource.data.authorName == profile(request.auth.uid).name
+        && request.resource.data.authorMastery == 1
+        && text(request.resource.data.title,120) && text(request.resource.data.description,2000)
+        && request.resource.data.postType in ['SHARE','FIND'] && request.resource.data.timestamp == request.time;
+      allow delete: if self(resource.data.authorUid);
+      allow update: if false;
+    }
+    match /freedom_wall/{id} {
+      allow read: if member();
+      allow create: if member() && request.resource.data.keys().hasOnly([
+        'id','authorUid','authorName','authorIconName','content','timestamp','likes','likedBy','colorHex','topComment','commentCount','anonymous'])
+        && request.resource.data.id == id && request.resource.data.authorUid == request.auth.uid
+        && text(request.resource.data.content,2000) && request.resource.data.timestamp == request.time
+        && request.resource.data.likes == 0 && request.resource.data.likedBy == []
+        && request.resource.data.commentCount == 0 && request.resource.data.topComment == null;
+      function ownLike() {
+        let before = resource.data.likedBy.toSet();
+        let after = request.resource.data.likedBy.toSet();
+        return request.resource.data.diff(resource.data).affectedKeys().hasOnly(['likedBy','likes'])
+          && request.resource.data.likedBy is list && request.resource.data.likedBy.size() <= 10000
+          && request.resource.data.likedBy.size() == after.size()
+          && request.resource.data.likes == after.size()
+          && ((!(request.auth.uid in before) && after == before.union([request.auth.uid].toSet()))
+            || ((request.auth.uid in before) && after == before.difference([request.auth.uid].toSet())));
+      }
+      function newComment() {
+        let key = request.resource.data.lastCommentId;
+        let comment = getAfter(/databases/$(database)/documents/freedom_wall/$(id)/comments/$(key)).data;
+        return request.resource.data.diff(resource.data).affectedKeys().hasOnly(['commentCount','topComment','lastCommentId'])
+          && !exists(/databases/$(database)/documents/freedom_wall/$(id)/comments/$(key))
+          && request.resource.data.commentCount == resource.data.commentCount + 1
+          && comment.authorUid == request.auth.uid && comment.timestamp == request.time
+          && request.resource.data.topComment == comment.content;
+      }
+      allow update: if member() && (ownLike() || newComment());
+      allow delete: if self(resource.data.authorUid);
+      match /comments/{commentId} {
+        allow read: if member() && exists(/databases/$(database)/documents/freedom_wall/$(id));
+        allow create: if member() && request.resource.data.keys().hasOnly([
+          'id','postId','authorUid','authorName','authorIconName','content','timestamp','anonymous'])
+          && request.resource.data.id == commentId && request.resource.data.postId == id
+          && request.resource.data.authorUid == request.auth.uid && text(request.resource.data.content,2000)
+          && request.resource.data.timestamp == request.time
+          && getAfter(/databases/$(database)/documents/freedom_wall/$(id)).data.lastCommentId == commentId
+          && getAfter(/databases/$(database)/documents/freedom_wall/$(id)).data.commentCount
+            == get(/databases/$(database)/documents/freedom_wall/$(id)).data.commentCount + 1;
+        allow update, delete: if false;
+      }
+    }
+    match /notifications/{id} {
+      allow read: if self(resource.data.receiverUid);
+      allow create: if member() && request.resource.data.keys().hasOnly([
+        'id','receiverUid','type','title','content','senderUid','senderName','senderIconName','senderDept',
+        'skillOffered','skillWanted','timestamp','isRead','read'])
+        && request.resource.data.id == id && request.resource.data.senderUid == request.auth.uid
+        && request.resource.data.receiverUid != request.auth.uid && text(request.resource.data.receiverUid,128)
+        && request.resource.data.type == 'SKILL_EXCHANGE' && text(request.resource.data.content,2000)
+        && text(request.resource.data.skillOffered,100) && text(request.resource.data.skillWanted,100)
+        && request.resource.data.senderName == profile(request.auth.uid).name
+        && request.resource.data.timestamp == request.time && request.resource.data.isRead == false && request.resource.data.read == false;
+      allow update: if self(resource.data.receiverUid)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isRead','read'])
+        && request.resource.data.isRead == true && request.resource.data.read == true;
+      allow delete: if self(resource.data.receiverUid);
+    }
+    match /exchanges/{id} {
+      allow read: if participant(resource.data);
+      function initialExchange() {
+        let e = request.resource.data;
+        let n = get(/databases/$(database)/documents/notifications/$(id)).data;
+        return member() && e.keys().hasOnly(['id','requesterUid','responderUid','skillOffered','skillWanted','status',
+          'requesterMarkedDone','responderMarkedDone','requesterRated','responderRated','requesterTeachingRating',
+          'requesterLearningRating','responderTeachingRating','responderLearningRating','timestamp'])
+          && e.id == id && e.responderUid == request.auth.uid && e.requesterUid != e.responderUid
+          && n.receiverUid == e.responderUid && n.senderUid == e.requesterUid && n.type == 'SKILL_EXCHANGE'
+          && e.skillOffered == n.skillOffered && e.skillWanted == n.skillWanted
+          && !existsAfter(/databases/$(database)/documents/notifications/$(id))
+          && e.status == 'ACTIVE' && e.timestamp == request.time
+          && e.requesterMarkedDone == false && e.responderMarkedDone == false
+          && e.requesterRated == false && e.responderRated == false
+          && e.requesterTeachingRating == 0 && e.requesterLearningRating == 0
+          && e.responderTeachingRating == 0 && e.responderLearningRating == 0;
+      }
+      function complete() {
+        let e = request.resource.data;
+        let requester = request.auth.uid == resource.data.requesterUid;
+        return e.diff(resource.data).affectedKeys().hasOnly(requester ? ['requesterMarkedDone','status'] : ['responderMarkedDone','status'])
+          && (requester ? e.requesterMarkedDone == true : e.responderMarkedDone == true)
+          && resource.data.status == 'ACTIVE'
+          && e.status == ((e.requesterMarkedDone && e.responderMarkedDone) ? 'DONE' : 'ACTIVE');
+      }
+      function rate() {
+        let e = request.resource.data;
+        let requester = request.auth.uid == resource.data.requesterUid;
+        let key = id + '_' + request.auth.uid;
+        let r = getAfter(/databases/$(database)/documents/exchange_ratings/$(key)).data;
+        return resource.data.status == 'DONE'
+          && e.diff(resource.data).affectedKeys().hasOnly(requester
+             ? ['requesterRated','responderTeachingRating','responderLearningRating']
+             : ['responderRated','requesterTeachingRating','requesterLearningRating'])
+          && (requester ? !resource.data.requesterRated && e.requesterRated : !resource.data.responderRated && e.responderRated)
+          && !exists(/databases/$(database)/documents/exchange_ratings/$(key))
+          && r.raterUid == request.auth.uid && r.exchangeId == id
+          && (requester ? e.responderTeachingRating == r.teachingRating && e.responderLearningRating == r.learningRating
+                        : e.requesterTeachingRating == r.teachingRating && e.requesterLearningRating == r.learningRating);
+      }
+      allow create: if initialExchange();
+      allow update: if participant(resource.data) && (complete() || rate());
+      allow delete: if false;
+    }
+    match /exchange_ratings/{id} {
+      allow read: if member();
+      function validRating() {
+        let r = request.resource.data;
+        let e = get(/databases/$(database)/documents/exchanges/$(r.exchangeId)).data;
+        let after = getAfter(/databases/$(database)/documents/exchanges/$(r.exchangeId)).data;
+        let requester = request.auth.uid == e.requesterUid;
+        return member() && r.keys().hasOnly(['exchangeId','raterUid','targetUid','teachingRating','learningRating','taughtSkillName','learnedSkillName','timestamp'])
+          && participant(e) && e.status == 'DONE' && id == r.exchangeId + '_' + request.auth.uid
+          && r.raterUid == request.auth.uid && r.targetUid == (requester ? e.responderUid : e.requesterUid)
+          && r.teachingRating is number && r.teachingRating >= 1 && r.teachingRating <= 5
+          && r.learningRating is number && r.learningRating >= 1 && r.learningRating <= 5
+          && r.taughtSkillName == (requester ? e.skillWanted : e.skillOffered)
+          && r.learnedSkillName == (requester ? e.skillOffered : e.skillWanted)
+          && r.timestamp == request.time
+          && (requester ? !e.requesterRated && after.requesterRated : !e.responderRated && after.responderRated);
+      }
+      allow create: if validRating();
+      allow update, delete: if false;
+    }
+    match /messages/{chatId} {
+      allow read: if member() && request.auth.uid in resource.data.members;
+      allow create: if member() && request.resource.data.keys().hasOnly(['members'])
+        && request.resource.data.members is list && request.resource.data.members.size() == 2
+        && request.resource.data.members[0] != request.resource.data.members[1]
+        && request.auth.uid in request.resource.data.members
+        && chatId == request.resource.data.members[0] + '_' + request.resource.data.members[1];
+      allow update: if member() && request.auth.uid in resource.data.members && request.resource.data == resource.data;
+      allow delete: if false;
+      match /history/{id} {
+        allow read: if member() && request.auth.uid in chat(chatId).members;
+        allow create: if request.resource.data.keys().hasOnly(['id','senderUid','receiverUid','text','timestamp','isRead','read'])
+          && request.resource.data.id == id && validMessage(request.resource.data, chatId);
+        allow update: if self(resource.data.receiverUid)
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isRead','read'])
+          && request.resource.data.isRead == true && request.resource.data.read == true;
+        allow delete: if false;
+      }
+    }
+    match /chat_summaries/{uid}/chats/{otherUid} {
+      allow read: if self(uid);
+      function summaryMessage() {
+        let s = request.resource.data;
+        let m = getAfter(/databases/$(database)/documents/messages/$(s.chatId)/history/$(s.lastMessageId)).data;
+        return member() && s.keys().hasOnly(['otherUserUid','otherUserName','otherUserIconName','otherUserDept','lastMessage',
+          'timestamp','unreadCount','lastMessageSenderUid','lastMessageRead','isRead','otherUserOnline','typing','lastMessageId','chatId'])
+          && s.otherUserUid == otherUid && request.auth.uid in [uid,otherUid]
+          && chatAfter(s.chatId).members.hasAll([uid,otherUid])
+          && m.senderUid == request.auth.uid && m.receiverUid in [uid,otherUid]
+          && m.timestamp == request.time && s.timestamp == request.time && s.lastMessage == m.text
+          && s.lastMessageSenderUid == request.auth.uid && s.unreadCount in [0,1];
+      }
+      allow create: if summaryMessage();
+      allow update: if summaryMessage()
+        || (self(uid) && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['unreadCount','lastMessageRead','isRead'])
+            && request.resource.data.unreadCount == 0 && request.resource.data.lastMessageRead == true && request.resource.data.isRead == true)
+        || (self(otherUid) && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['typing']) && request.resource.data.typing is bool);
+      allow delete: if false;
+    }
+    match /{document=**} { allow read, write: if false; }
+  }
+}
