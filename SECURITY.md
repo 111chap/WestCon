@@ -8,7 +8,17 @@ The repository includes owner CODEOWNERS, read-only CI, application and Firestor
 gh api --method PUT repos/111chap/WestCon/branches/main/protection --input .github/branch-protection.json
 ```
 
-This requires pull requests, a fresh owner review, all three checks, resolved conversations and an up-to-date branch; force pushes and deletion are disabled. The owner retains an emergency admin bypass. The configuration file does not enable these settings by itself.
+This MVP configuration requires pull requests with zero mandatory approvals, all three checks (`android`, `firestore-rules`, and `repository-guardrails`), resolved conversations and an up-to-date branch. Code-owner approval and approval of the latest push are not required, so a solo maintainer can merge their own pull requests after the checks pass. Force pushes and branch deletion are disabled. Administrators retain a bypass; routine work should still use pull requests.
+
+The configuration file and merging changes to it do not activate branch protection. Apply it with the command above using an authenticated account with repository administration permission, then verify the live settings:
+
+```sh
+gh api repos/111chap/WestCon/branches/main/protection
+```
+
+In GitHub Settings > Branches, verify that `main` requires a pull request, zero approvals, the three named status checks, resolved conversations and an up-to-date branch; leave force pushes and deletion disabled and administrator enforcement off. If a separate repository or organization ruleset applies to `main`, it may impose additional requirements.
+
+Branch protection controls changes to the repository. Firestore rules control access to application data; follow the rollout below to activate that protection.
 
 ## Firebase rules rollout
 
