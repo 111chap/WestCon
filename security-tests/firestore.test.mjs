@@ -45,7 +45,7 @@ test('exchange requests are authentic, private and accepted only by the recipien
   await assertSucceeds(setDoc(doc(user('alice'), 'notifications/request1'), notification('request1')));
   await assertFails(getDoc(doc(user('eve'), 'notifications/request1')));
   await assertFails(setDoc(doc(user('eve'), 'notifications/spoof'), { ...notification('spoof'), senderUid: 'alice' }));
-  const fake = writeBatch(user('eve')); fake.set(doc(user('eve'), 'exchanges/request1'), { ...exchange('request1'), timestamp: serverTimestamp() }); fake.delete(doc(user('eve'), 'notifications/request1'));
+  const eveDb = user('eve'), fake = writeBatch(eveDb); fake.set(doc(eveDb, 'exchanges/request1'), { ...exchange('request1'), timestamp: serverTimestamp() }); fake.delete(doc(eveDb, 'notifications/request1'));
   await assertFails(fake.commit());
   const db = user('bob'), batch = writeBatch(db);
   batch.set(doc(db, 'exchanges/request1'), { ...exchange('request1'), timestamp: serverTimestamp() });
