@@ -105,3 +105,4 @@ fun LandingScreen(onSignUpClick: () -> Unit, onLoginClick: () -> Unit) {
         }
     }
 }
+

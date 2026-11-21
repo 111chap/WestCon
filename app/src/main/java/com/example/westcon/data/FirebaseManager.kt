@@ -4,6 +4,8 @@ import com.example.westcon.data.FirestoreCollections
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.Query
+import com.google.firebase.firestore.SetOptions
+import com.google.firebase.firestore.FieldValue
 import com.google.firebase.Timestamp
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
@@ -21,20 +23,29 @@ object FirebaseManager {
     private val chatSummariesCollection by lazy { db.collection(FirestoreCollections.CHAT_SUMMARIES) }
     private val notificationsCollection by lazy { db.collection(FirestoreCollections.NOTIFICATIONS) }
 
+    private val ratingsCollection by lazy { db.collection("exchange_ratings") }
+    private fun memberUid(): String {
+        val user = auth.currentUser ?: throw SecurityException("Sign in first")
+        require(user.isEmailVerified && SecurityPolicy.schoolEmail(user.email ?: "")) { "Verify your WVSU email first" }
+        return user.uid
+    }
+
     // --- Authentication ---
     fun getCurrentUser() = auth.currentUser
     fun isUserLoggedIn() = auth.currentUser != null
 
     suspend fun signUp(email: String, pass: String): Result<String> {
         return try {
-            val result = auth.createUserWithEmailAndPassword(email, pass).await()
+            require(SecurityPolicy.schoolEmail(email) && pass.length in 8..128) { "Use a WVSU email and an 8–128 character password" }
+            val result = auth.createUserWithEmailAndPassword(email.trim().lowercase(), pass).await()
             Result.success(result.user?.uid ?: "")
         } catch (e: Exception) { Result.failure(e) }
     }
 
     suspend fun login(email: String, pass: String): Result<String> {
         return try {
-            val result = auth.signInWithEmailAndPassword(email, pass).await()
+            require(SecurityPolicy.schoolEmail(email) && pass.length in 1..128) { "Invalid login details" }
+            val result = auth.signInWithEmailAndPassword(email.trim().lowercase(), pass).await()
             Result.success(result.user?.uid ?: "")
         } catch (e: Exception) { Result.failure(e) }
     }
@@ -46,10 +57,10 @@ object FirebaseManager {
     }
 
     suspend fun reloadUser(): Result<Unit> {
-        return try { auth.currentUser?.reload()?.await(); Result.success(Unit) } catch (e: Exception) { Result.failure(e) }
+        return try { val user = auth.currentUser ?: throw SecurityException("Sign in first"); user.reload().await(); user.getIdToken(true).await(); Result.success(Unit) } catch (e: Exception) { Result.failure(e) }
     }
 
-    fun isEmailVerified(): Boolean = auth.currentUser?.isEmailVerified ?: false
+    fun isEmailVerified(): Boolean = auth.currentUser?.let { it.isEmailVerified && SecurityPolicy.schoolEmail(it.email ?: "") } ?: false
 
     suspend fun sendPasswordResetEmail(email: String): Result<Unit> {
         return try { auth.sendPasswordResetEmail(email).await(); Result.success(Unit) } catch (e: Exception) { Result.failure(e) }
@@ -57,23 +68,34 @@ object FirebaseManager {
 
     // --- User Profile ---
     suspend fun checkUsernameExists(username: String): Boolean {
-        return try { val query = usersCollection.whereEqualTo("name", username).get().await(); !query.isEmpty } catch (e: Exception) { false }
+        return try { val query = usersCollection.whereEqualTo("email", "").whereEqualTo("name", username).get().await(); !query.isEmpty } catch (e: Exception) { false }
     }
 
     fun getUserProfileFlow(uid: String): Flow<UserProfile?> = callbackFlow {
-        val subscription = usersCollection.document(uid)
-            .addSnapshotListener { snapshot, error ->
-                if (error == null && snapshot != null) {
-                    trySend(snapshot.toObject(UserProfile::class.java))
-                } else {
-                    trySend(null)
-                }
-            }
-        awaitClose { subscription.remove() }
+        var profile: UserProfile? = null
+        var ratings = emptyList<ExchangeRating>()
+        fun publish() { trySend(profile?.withPeerRatings(ratings)) }
+        val subscription = usersCollection.document(uid).addSnapshotListener { snapshot, error ->
+            profile = if (error == null) snapshot?.toObject(UserProfile::class.java)?.copy(uid = uid, email = "") else null
+            publish()
+        }
+        val ratingSubscription = ratingsCollection.whereEqualTo("targetUid", uid).addSnapshotListener { snapshot, _ ->
+            ratings = snapshot?.toObjects(ExchangeRating::class.java) ?: emptyList()
+            publish()
+        }
+        awaitClose { subscription.remove(); ratingSubscription.remove() }
     }
 
-    suspend fun saveUserProfile(profile: UserProfile): Result<Unit> {
-        return try { usersCollection.document(profile.uid).set(profile).await(); Result.success(Unit) } catch (e: Exception) { Result.failure(e) }
+    suspend fun saveUserProfile(profile: UserProfile): Result<Unit> = runCatching {
+        val uid = memberUid()
+        require(profile.uid == uid) { "Cannot edit another account" }
+        SecurityPolicy.requireText(profile.name, 80)
+        require(profile.about.length <= 2000 && profile.skillsToTeach.size <= 30 && profile.skillsLearning.size <= 30)
+        val publicProfile = profile.copy(email = "", rating = 0.0, swaps = 0,
+            skillsToTeach = profile.skillsToTeach.map { it.copy(averageRating = 0.0, totalRatings = 0, level = 1) },
+            skillsLearning = profile.skillsLearning.map { it.copy(rating = 0.0) })
+        usersCollection.document(uid).set(publicProfile).await()
+        Unit
     }
 
     suspend fun isProfileComplete(uid: String): Boolean {
@@ -104,10 +126,10 @@ object FirebaseManager {
                 }
             }
 
-            UserProfile(
-                uid = data["uid"] as? String ?: uid,
+            val profile = UserProfile(
+                uid = uid,
                 name = data["name"] as? String ?: "",
-                email = data["email"] as? String ?: "",
+                email = "",
                 profileIconName = data["profileIconName"] as? String ?: "Person",
                 department = data["department"] as? String ?: "",
                 course = data["course"] as? String ?: "",
@@ -127,11 +149,16 @@ object FirebaseManager {
                 } ?: emptyList(),
                 skillsLearning = migratedSkillsLearning
             )
+            val ratings = ratingsCollection.whereEqualTo("targetUid", uid).get().await().toObjects(ExchangeRating::class.java)
+            profile.withPeerRatings(ratings)
         } catch (e: Exception) { null }
     }
 
     fun getAllUserProfiles(): Flow<List<UserProfile>> = callbackFlow {
-        val subscription = usersCollection.addSnapshotListener { snapshot, error ->
+        var profiles = emptyList<UserProfile>()
+        var ratings = emptyList<ExchangeRating>()
+        fun publish() { trySend(profiles.map { it.withPeerRatings(ratings) }) }
+        val subscription = usersCollection.whereEqualTo("email", "").addSnapshotListener { snapshot, error ->
             if (error != null) return@addSnapshotListener
             if (snapshot != null) {
                 val list = snapshot.documents.mapNotNull { doc ->
@@ -154,7 +181,7 @@ object FirebaseManager {
                         UserProfile(
                             uid = doc.id,
                             name = data["name"] as? String ?: "",
-                            email = data["email"] as? String ?: "",
+                            email = "",
                             profileIconName = data["profileIconName"] as? String ?: "Person",
                             department = data["department"] as? String ?: "",
                             course = data["course"] as? String ?: "",
@@ -176,10 +203,15 @@ object FirebaseManager {
                         )
                     } catch (e: Exception) { null }
                 }
-                trySend(list)
+                profiles = list
+                publish()
             }
         }
-        awaitClose { subscription.remove() }
+        val ratingSubscription = ratingsCollection.addSnapshotListener { snapshot, _ ->
+            ratings = snapshot?.toObjects(ExchangeRating::class.java) ?: emptyList()
+            publish()
+        }
+        awaitClose { subscription.remove(); ratingSubscription.remove() }
     }
 
     // --- Skill Exchanges ---
@@ -199,75 +231,47 @@ object FirebaseManager {
         } catch (e: Exception) { null }
     }
 
-    suspend fun markExchangeDone(exchangeId: String, uid: String): Result<Unit> {
-        return try {
-            val docRef = exchangesCollection.document(exchangeId)
-            val snapshot = docRef.get().await()
-            val exchange = snapshot.toObject(SkillExchange::class.java) ?: return Result.failure(Exception("Exchange not found"))
-            val isRequester = exchange.requesterUid == uid
-            val updateField = if (isRequester) "requesterMarkedDone" else "responderMarkedDone"
-            docRef.update(updateField, true).await()
-            val profile = getUserProfile(uid)
-            if (profile != null) {
-                val skillLearned = if (isRequester) exchange.skillWanted else exchange.skillOffered
-                val updatedLearning = profile.skillsLearning.map { if (it.skillName.equals(skillLearned, ignoreCase = true)) it.copy(isDone = true) else it }
-                saveUserProfile(profile.copy(skillsLearning = updatedLearning))
-            }
-            val updatedSnapshot = docRef.get().await()
-            val updatedExchange = updatedSnapshot.toObject(SkillExchange::class.java)!!
-            if (updatedExchange.requesterMarkedDone && updatedExchange.responderMarkedDone) docRef.update("status", "DONE").await()
-            Result.success(Unit)
-        } catch (e: Exception) { Result.failure(e) }
+    suspend fun markExchangeDone(exchangeId: String, uid: String): Result<Unit> = runCatching {
+        require(uid == memberUid() && SecurityPolicy.documentId(exchangeId)) { "Invalid exchange owner" }
+        val ref = exchangesCollection.document(exchangeId)
+        db.runTransaction { transaction ->
+            val exchange = transaction.get(ref).toObject(SkillExchange::class.java) ?: error("Exchange not found")
+            SecurityPolicy.requireParticipant(exchange.requesterUid, exchange.responderUid, uid)
+            val requester = uid == exchange.requesterUid
+            val done = if (requester) exchange.responderMarkedDone else exchange.requesterMarkedDone
+            transaction.update(ref, if (requester) "requesterMarkedDone" else "responderMarkedDone", true,
+                "status", if (done) "DONE" else "ACTIVE")
+        }.await()
+        Unit
     }
 
     suspend fun submitExchangeRating(
-        exchangeId: String,
-        targetUid: String,
-        teachingRating: Double,
-        learningRating: Double,
-        taughtSkillName: String,
-        learnedSkillName: String
-    ): Result<Unit> {
-        return try {
-            val currentUid = auth.currentUser?.uid ?: return Result.failure(Exception("Not logged in"))
-            val exDoc = exchangesCollection.document(exchangeId)
-            val snapshot = exDoc.get().await()
-            val exchange = snapshot.toObject(SkillExchange::class.java) ?: return Result.failure(Exception("Exchange not found"))
-
-            if (exchange.requesterUid == currentUid && exchange.requesterRated) return Result.failure(Exception("Already rated"))
-            if (exchange.responderUid == currentUid && exchange.responderRated) return Result.failure(Exception("Already rated"))
-
-            val isRequester = exchange.requesterUid == currentUid
-            val prefix = if (isRequester) "requester" else "responder"
-            val updates = mapOf(
-                "${prefix}Rated" to true,
-                if (isRequester) "responderTeachingRating" to teachingRating else "requesterTeachingRating" to teachingRating,
-                if (isRequester) "responderLearningRating" to learningRating else "requesterLearningRating" to learningRating
-            )
-            exDoc.update(updates).await()
-
-            val profile = getUserProfile(targetUid) ?: return Result.failure(Exception("User not found"))
-            val teachSkills = profile.skillsToTeach.toMutableList()
-            val teachIdx = teachSkills.indexOfFirst { it.skillName.equals(taughtSkillName, ignoreCase = true) }
-            if (teachIdx != -1) {
-                val s = teachSkills[teachIdx]; val nTotal = s.totalRatings + 1; val nAvg = ((s.averageRating * s.totalRatings) + teachingRating) / nTotal
-                val nLevel = when { nAvg >= 4.5 && nTotal >= 15 -> 5; nAvg >= 4.0 && nTotal >= 10 -> 4; nAvg >= 3.5 && nTotal >= 6 -> 3; nAvg >= 3.0 && nTotal >= 3 -> 2; else -> 1 }
-                teachSkills[teachIdx] = s.copy(averageRating = nAvg, totalRatings = nTotal, level = nLevel)
-            }
-
-            val learnSkills = profile.skillsLearning.toMutableList()
-            val learnIdx = learnSkills.indexOfFirst { it.skillName.equals(learnedSkillName, ignoreCase = true) }
-            if (learnIdx != -1) learnSkills[learnIdx] = learnSkills[learnIdx].copy(rating = learningRating, isDone = true)
-            else learnSkills.add(LearningSkill(skillName = learnedSkillName, rating = learningRating, isDone = true))
-
-            val rLearning = learnSkills.filter { it.rating > 0 }; val sumL = rLearning.sumOf { it.rating }
-            val rTeaching = teachSkills.filter { it.totalRatings > 0 }; val sumT = rTeaching.sumOf { it.averageRating * it.totalRatings }
-            val totalC = rLearning.size + rTeaching.sumOf { it.totalRatings }
-            val fRating = if (totalC > 0) (sumL + sumT) / totalC else 0.0
-
-            saveUserProfile(profile.copy(skillsToTeach = teachSkills, skillsLearning = learnSkills, rating = fRating))
-            Result.success(Unit)
-        } catch (e: Exception) { Result.failure(e) }
+        exchangeId: String, targetUid: String, teachingRating: Double, learningRating: Double,
+        taughtSkillName: String, learnedSkillName: String
+    ): Result<Unit> = runCatching {
+        val uid = memberUid()
+        require(SecurityPolicy.documentId(exchangeId))
+        SecurityPolicy.requireRating(teachingRating); SecurityPolicy.requireRating(learningRating)
+        val ref = exchangesCollection.document(exchangeId)
+        val ratingRef = ratingsCollection.document(exchangeId + "_" + uid)
+        db.runTransaction { transaction ->
+            val exchange = transaction.get(ref).toObject(SkillExchange::class.java) ?: error("Exchange not found")
+            SecurityPolicy.requireParticipant(exchange.requesterUid, exchange.responderUid, uid)
+            require(exchange.status == "DONE") { "Complete the exchange before rating" }
+            val requester = uid == exchange.requesterUid
+            require(targetUid == if (requester) exchange.responderUid else exchange.requesterUid) { "Invalid rating target" }
+            require(!(if (requester) exchange.requesterRated else exchange.responderRated)) { "Already rated" }
+            val taught = if (requester) exchange.skillWanted else exchange.skillOffered
+            val learned = if (requester) exchange.skillOffered else exchange.skillWanted
+            val record = ExchangeRating(exchangeId, uid, targetUid, teachingRating, learningRating, taught, learned)
+            transaction.set(ratingRef, record)
+            transaction.update(ratingRef, "timestamp", FieldValue.serverTimestamp())
+            transaction.update(ref, mapOf(
+                (if (requester) "requesterRated" else "responderRated") to true,
+                (if (requester) "responderTeachingRating" else "requesterTeachingRating") to teachingRating,
+                (if (requester) "responderLearningRating" else "requesterLearningRating") to learningRating))
+        }.await()
+        Unit
     }
 
     fun getRelevantExchangeFlow(currentUid: String, otherUid: String): Flow<SkillExchange?> = callbackFlow {
@@ -327,56 +331,24 @@ object FirebaseManager {
         }
     }
 
-    suspend fun acceptExchangeRequest(notification: Notification): Result<Unit> {
-        return try {
-            val currentUid = auth.currentUser?.uid ?: return Result.failure(Exception("Not logged in"))
-            val senderUid = notification.senderUid ?: return Result.failure(Exception("Sender UID missing"))
-            val skillOffered = notification.skillOffered ?: ""
-            val skillWanted = notification.skillWanted ?: ""
-
-            // STRICT ENFORCEMENT: Check for existing active exchange
-            val existing = getActiveExchange(currentUid, senderUid)
-            if (existing != null) {
-                return Result.failure(Exception("You already have an active exchange with this user. Please complete it first."))
-            }
-
-            val exchangeRef = exchangesCollection.document()
-            val exchange = SkillExchange(
-                id = exchangeRef.id,
-                requesterUid = senderUid,
-                responderUid = currentUid,
-                skillOffered = skillOffered,
-                skillWanted = skillWanted,
-                status = "ACTIVE"
-            )
-            exchangeRef.set(exchange).await()
-
-            val senderProfile = getUserProfile(senderUid)
-            val responderProfile = getUserProfile(currentUid)
-
-            if (senderProfile != null) {
-                val updatedLearning = senderProfile.skillsLearning.toMutableList()
-                if (skillWanted.isNotBlank() && updatedLearning.none { it.skillName.equals(skillWanted, ignoreCase = true) }) {
-                    updatedLearning.add(LearningSkill(skillName = skillWanted, exchangeId = exchange.id))
-                }
-                saveUserProfile(senderProfile.copy(skillsLearning = updatedLearning, swaps = senderProfile.swaps + 1))
-            }
-
-            if (responderProfile != null) {
-                val updatedLearning = responderProfile.skillsLearning.toMutableList()
-                if (skillOffered.isNotBlank() && updatedLearning.none { it.skillName.equals(skillOffered, ignoreCase = true) }) {
-                    updatedLearning.add(LearningSkill(skillName = skillOffered, exchangeId = exchange.id))
-                }
-                saveUserProfile(responderProfile.copy(skillsLearning = updatedLearning, swaps = responderProfile.swaps + 1))
-            }
-
-            val chatId = getChatId(currentUid, senderUid)
-            sendMessage(Message(senderUid = currentUid, receiverUid = senderUid, text = "I've accepted your exchange request! I'll teach you $skillWanted and you'll teach me $skillOffered."), chatId)
-            deleteNotification(notification.id)
-            Result.success(Unit)
-        } catch (e: Exception) {
-            Result.failure(e)
-        }
+    suspend fun acceptExchangeRequest(notification: Notification): Result<Unit> = runCatching {
+        val uid = memberUid()
+        require(SecurityPolicy.documentId(notification.id))
+        val notificationRef = notificationsCollection.document(notification.id)
+        // Stable ID makes duplicate acceptance conflict on the same exchange document.
+        val ref = exchangesCollection.document(notification.id)
+        db.runTransaction { transaction ->
+            val request = transaction.get(notificationRef).toObject(Notification::class.java) ?: error("Request not found")
+            val sender = request.senderUid ?: error("Sender missing")
+            require(request.receiverUid == uid && sender != uid && request.type == "SKILL_EXCHANGE") { "Not your exchange request" }
+            require(!transaction.get(ref).exists()) { "Already accepted" }
+            val exchange = SkillExchange(id = ref.id, requesterUid = sender, responderUid = uid,
+                skillOffered = request.skillOffered ?: "", skillWanted = request.skillWanted ?: "")
+            transaction.set(ref, exchange)
+            transaction.update(ref, "timestamp", FieldValue.serverTimestamp())
+            transaction.delete(notificationRef)
+        }.await()
+        Unit
     }
 
     // --- Presence ---
@@ -395,12 +367,24 @@ object FirebaseManager {
     }
 
     // --- Skill Marketplace ---
-    suspend fun postSkill(post: SkillPost): Result<Unit> {
-        return try { val ref = skillsCollection.document(); ref.set(post.copy(id = ref.id)).await(); Result.success(Unit) } catch (e: Exception) { Result.failure(e) }
+    suspend fun postSkill(post: SkillPost): Result<Unit> = runCatching {
+        val uid = memberUid()
+        val profile = getUserProfile(uid) ?: error("Complete your profile")
+        SecurityPolicy.requireText(post.title, 120); SecurityPolicy.requireText(post.description, 2000)
+        val ref = skillsCollection.document()
+        val batch = db.batch()
+        batch.set(ref, post.copy(id = ref.id, authorUid = uid, authorName = profile.name,
+            authorIconName = profile.profileIconName, authorMastery = 1, department = profile.department))
+        batch.update(ref, "timestamp", FieldValue.serverTimestamp()); batch.commit().await()
+        Unit
     }
 
-    suspend fun deleteSkillPost(postId: String): Result<Unit> {
-        return try { skillsCollection.document(postId).delete().await(); Result.success(Unit) } catch (e: Exception) { Result.failure(e) }
+    suspend fun deleteSkillPost(postId: String): Result<Unit> = runCatching {
+        require(SecurityPolicy.documentId(postId))
+        val ref = skillsCollection.document(postId)
+        require(ref.get().await().getString("authorUid") == memberUid()) { "Not your post" }
+        ref.delete().await()
+        Unit
     }
 
     fun getSkillPosts(): Flow<List<SkillPost>> = callbackFlow {
@@ -409,15 +393,24 @@ object FirebaseManager {
     }
 
     // --- Freedom Wall ---
-    suspend fun postToFreedomWall(post: FreedomPost): Result<Unit> {
-        return try {
-            val authorUid = auth.currentUser?.uid ?: ""; val profile = getUserProfile(authorUid)
-            val ref = freedomWallCollection.document(); ref.set(post.copy(id = ref.id, authorUid = authorUid, authorName = profile?.name ?: "User", authorIconName = profile?.profileIconName ?: "Person")).await(); Result.success(Unit)
-        } catch (e: Exception) { Result.failure(e) }
+    suspend fun postToFreedomWall(post: FreedomPost): Result<Unit> = runCatching {
+        val uid = memberUid()
+        SecurityPolicy.requireText(post.content, 2000)
+        val profile = getUserProfile(uid) ?: error("Complete your profile")
+        val ref = freedomWallCollection.document()
+        val batch = db.batch()
+        batch.set(ref, post.copy(id = ref.id, authorUid = uid, authorName = if (post.anonymous) "Anonymous Taga-West" else profile.name,
+            authorIconName = if (post.anonymous) "VisibilityOff" else profile.profileIconName, likes = 0, likedBy = emptyList(), commentCount = 0, topComment = null))
+        batch.update(ref, "timestamp", FieldValue.serverTimestamp()); batch.commit().await()
+        Unit
     }
 
-    suspend fun deleteFreedomPost(postId: String): Result<Unit> {
-        return try { freedomWallCollection.document(postId).delete().await(); Result.success(Unit) } catch (e: Exception) { Result.failure(e) }
+    suspend fun deleteFreedomPost(postId: String): Result<Unit> = runCatching {
+        require(SecurityPolicy.documentId(postId))
+        val ref = freedomWallCollection.document(postId)
+        require(ref.get().await().getString("authorUid") == memberUid()) { "Not your post" }
+        ref.delete().await()
+        Unit
     }
 
     fun getFreedomPosts(): Flow<List<FreedomPost>> = callbackFlow {
@@ -425,21 +418,24 @@ object FirebaseManager {
         awaitClose { subscription.remove() }
     }
 
-    suspend fun toggleLikeFreedomPost(postId: String): Result<Unit> {
-        return try {
-            val uid = auth.currentUser?.uid ?: return Result.failure(Exception("Not logged in"))
-            val docRef = freedomWallCollection.document(postId); val snapshot = docRef.get().await(); val post = snapshot.toObject(FreedomPost::class.java)?.copy(id = snapshot.id) ?: return Result.failure(Exception("Post not found"))
-            val likedBy = post.likedBy.toMutableList(); var likes = post.likes
-            if (likedBy.contains(uid)) { likedBy.remove(uid); likes-- } else { likedBy.add(uid); likes++ }
-            docRef.update("likedBy", likedBy, "likes", likes).await(); Result.success(Unit)
-        } catch (e: Exception) { Result.failure(e) }
+    suspend fun toggleLikeFreedomPost(postId: String): Result<Unit> = runCatching {
+        val uid = memberUid(); require(SecurityPolicy.documentId(postId))
+        val ref = freedomWallCollection.document(postId)
+        db.runTransaction { transaction ->
+            val snapshot = transaction.get(ref)
+            val post = snapshot.toObject(FreedomPost::class.java) ?: error("Post missing")
+            val liked = post.likedBy.toMutableSet()
+            if (!liked.remove(uid)) liked.add(uid)
+            transaction.update(ref, "likedBy", liked.toList(), "likes", liked.size)
+        }.await()
+        Unit
     }
 
     suspend fun postComment(comment: FreedomComment): Result<Unit> {
         return try {
-            val postRef = freedomWallCollection.document(comment.postId); val commentRef = postRef.collection("comments").document(); val authorUid = auth.currentUser?.uid ?: ""; val profile = if (!comment.anonymous) getUserProfile(authorUid) else null
+            val postRef = freedomWallCollection.document(comment.postId); val commentRef = postRef.collection("comments").document(); val authorUid = memberUid(); SecurityPolicy.requireText(comment.content, 2000); val profile = if (!comment.anonymous) getUserProfile(authorUid) else null
             val finalComment = comment.copy(id = commentRef.id, authorUid = authorUid, authorName = if (comment.anonymous) "Anonymous Taga-West" else (profile?.name ?: "User"), authorIconName = if (comment.anonymous) "VisibilityOff" else (profile?.profileIconName ?: "Person"))
-            db.runTransaction { transaction -> val snapshot = transaction.get(postRef); val currentCommentCount = snapshot.getLong("commentCount") ?: 0; transaction.set(commentRef, finalComment); transaction.update(postRef, "commentCount", currentCommentCount + 1); transaction.update(postRef, "topComment", finalComment.content) }.await(); Result.success(Unit)
+            db.runTransaction { transaction -> val snapshot = transaction.get(postRef); val currentCommentCount = snapshot.getLong("commentCount") ?: 0; transaction.set(commentRef, finalComment); transaction.update(commentRef, "timestamp", FieldValue.serverTimestamp()); transaction.update(postRef, "commentCount", currentCommentCount + 1); transaction.update(postRef, "topComment", finalComment.content); transaction.update(postRef, "lastCommentId", commentRef.id) }.await(); Result.success(Unit)
         } catch (e: Exception) { Result.failure(e) }
     }
 
@@ -449,12 +445,28 @@ object FirebaseManager {
     }
 
     // --- Messaging ---
-    suspend fun sendMessage(msg: Message, chatId: String): Result<Unit> {
-        return try { val ref = messagesCollection.document(chatId).collection("history").document(); ref.set(msg.copy(id = ref.id)).await(); startChat(msg.senderUid, msg.receiverUid, msg.text); Result.success(Unit) } catch (e: Exception) { Result.failure(e) }
-    }
-
-    suspend fun startChat(uid: String, otherUid: String, firstMsg: String) {
-        updateChatSummary(uid, otherUid, firstMsg, isRecipient = false); updateChatSummary(otherUid, uid, firstMsg, isRecipient = true)
+    suspend fun sendMessage(msg: Message, chatId: String): Result<Unit> = runCatching {
+        val uid = memberUid()
+        require(msg.senderUid == uid && msg.receiverUid != uid && SecurityPolicy.documentId(msg.receiverUid)) { "Invalid sender or recipient" }
+        require(chatId == getChatId(uid, msg.receiverUid)) { "Invalid chat" }
+        val text = SecurityPolicy.requireText(msg.text, 4000)
+        val ref = messagesCollection.document(chatId).collection("history").document()
+        val sender = getUserProfile(uid) ?: error("Profile missing")
+        val recipient = getUserProfile(msg.receiverUid) ?: error("Recipient missing")
+        val batch = db.batch()
+        batch.set(messagesCollection.document(chatId), mapOf("members" to listOf(uid, msg.receiverUid).sorted()), SetOptions.merge())
+        batch.set(ref, msg.copy(id = ref.id, senderUid = uid, text = text, isRead = false, readCompat = false))
+        batch.update(ref, "timestamp", FieldValue.serverTimestamp())
+        for ((owner, other, profile) in listOf(Triple(uid, msg.receiverUid, recipient), Triple(msg.receiverUid, uid, sender))) {
+            val summaryRef = chatSummariesCollection.document(owner).collection("chats").document(other)
+            batch.set(summaryRef, ChatSummary(otherUserUid = other, otherUserName = profile.name,
+                otherUserIconName = profile.profileIconName, otherUserDept = profile.department,
+                lastMessage = text, unreadCount = if (owner == uid) 0 else 1,
+                lastMessageSenderUid = uid, lastMessageRead = owner == uid, isRead = owner == uid))
+            batch.update(summaryRef, mapOf("timestamp" to FieldValue.serverTimestamp(), "lastMessageId" to ref.id, "chatId" to chatId))
+        }
+        batch.commit().await()
+        Unit
     }
 
     suspend fun markChatAsRead(otherUid: String): Result<Unit> {
@@ -472,15 +484,7 @@ object FirebaseManager {
         } catch (e: Exception) { Result.failure(e) }
     }
 
-    private suspend fun updateChatSummary(uid: String, otherUid: String, lastMsg: String, isRecipient: Boolean) {
-        try {
-            val profile = try { getUserProfile(otherUid) } catch (e: Exception) { null }
-            val docRef = chatSummariesCollection.document(uid).collection("chats").document(otherUid)
-            val unreadCount = if (isRecipient) { val existingSnapshot = docRef.get().await(); val existingSummary = existingSnapshot.toObject(ChatSummary::class.java); (existingSummary?.unreadCount ?: 0) + 1 } else 0
-            val summary = ChatSummary(otherUserUid = otherUid, otherUserName = profile?.name ?: "User", otherUserIconName = profile?.profileIconName ?: "Person", otherUserDept = profile?.department ?: "WVSU", lastMessage = lastMsg, timestamp = com.google.firebase.Timestamp.now(), unreadCount = unreadCount, lastMessageSenderUid = if (isRecipient) otherUid else uid, lastMessageRead = !isRecipient, isRead = !isRecipient)
-            docRef.set(summary).await()
-        } catch (e: Exception) { }
-    }
+
 
     fun getMessages(chatId: String): Flow<List<Message>> = callbackFlow {
         val subscription = messagesCollection.document(chatId).collection("history").orderBy("timestamp", Query.Direction.ASCENDING).addSnapshotListener { snapshot, error -> if (error == null && snapshot != null) trySend(snapshot.documents.mapNotNull { doc -> doc.toObject(Message::class.java)?.copy(id = doc.id)?.apply { val data = doc.data; isRead = when { data?.get("isRead") is Boolean -> data["isRead"] as Boolean; data?.get("read") is Boolean -> data["read"] as Boolean; else -> isRead }; readCompat = isRead } }) }
@@ -517,7 +521,19 @@ object FirebaseManager {
     }
 
     // --- Notifications ---
-    suspend fun sendNotification(notification: Notification): Result<Unit> { return try { val ref = notificationsCollection.document(); ref.set(notification.copy(id = ref.id)).await(); Result.success(Unit) } catch (e: Exception) { Result.failure(e) } }
+    suspend fun sendNotification(notification: Notification): Result<Unit> = runCatching {
+        val uid = memberUid()
+        require(notification.type == "SKILL_EXCHANGE" && notification.receiverUid != uid && SecurityPolicy.documentId(notification.receiverUid))
+        SecurityPolicy.requireText(notification.content, 2000)
+        val profile = getUserProfile(uid) ?: error("Profile missing")
+        val ref = notificationsCollection.document()
+        val batch = db.batch()
+        batch.set(ref, notification.copy(id = ref.id, senderUid = uid, senderName = profile.name,
+            senderIconName = profile.profileIconName, senderDept = profile.department, isRead = false, readCompat = false))
+        batch.update(ref, "timestamp", FieldValue.serverTimestamp()); batch.commit().await()
+        Unit
+    }
+
     suspend fun deleteNotification(id: String): Result<Unit> { return try { notificationsCollection.document(id).delete().await(); Result.success(Unit) } catch (e: Exception) { Result.failure(e) } }
     suspend fun markNotificationAsRead(id: String): Result<Unit> { return try { notificationsCollection.document(id).update("isRead", true, "read", true).await(); Result.success(Unit) } catch (e: Exception) { Result.failure(e) } }
     suspend fun markAllNotificationsAsRead(): Result<Unit> {
@@ -540,3 +556,4 @@ object FirebaseManager {
         awaitClose { sub?.remove() }
     }
 }
+

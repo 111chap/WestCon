@@ -252,3 +252,4 @@ fun LoginScreen(onLoginSuccess: (String) -> Unit, onSignUpClick: () -> Unit, onB
         }
     }
 }
+

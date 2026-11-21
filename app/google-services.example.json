@@ -1,0 +1,14 @@
+{
+  "project_info": {
+    "project_number": "1234567890",
+    "project_id": "demo-westcon",
+    "storage_bucket": "demo-westcon.appspot.com"
+  },
+  "client": [{
+    "client_info": { "mobilesdk_app_id": "1:1234567890:android:0123456789abcdef", "android_client_info": { "package_name": "com.example.westcon" } },
+    "oauth_client": [],
+    "api_key": [{ "current_key": "AIzaSyDemoOnlyNotARealFirebaseAPIKey00000" }],
+    "services": { "appinvite_service": { "other_platform_oauth_client": [] } }
+  }],
+  "configuration_version": "1"
+}

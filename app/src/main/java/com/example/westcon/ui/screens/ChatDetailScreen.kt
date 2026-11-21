@@ -525,3 +525,4 @@ fun ChatInputBar(
         }
     }
 }
+

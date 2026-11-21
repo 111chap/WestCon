@@ -40,7 +40,6 @@ import kotlinx.coroutines.delay
 @Composable
 fun SignUpStepTwoScreen(
     email: String = "",
-    password: String = "",
     onNextClick: () -> Unit
 ) {
     var step by remember { mutableIntStateOf(0) }
@@ -347,7 +346,7 @@ fun SignUpStepTwoScreen(
                                 Spacer(modifier = Modifier.height(12.dp))
 
                                 Text("Password", fontSize = 12.sp, color = Color.Gray)
-                                Text("•".repeat(password.length), fontSize = 16.sp, fontWeight = FontWeight.Bold, color = WestconDarkBlue)
+                                Text("Already set securely", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = WestconDarkBlue)
 
                                 Spacer(modifier = Modifier.height(12.dp))
 
@@ -508,3 +507,4 @@ fun CustomDropdown(options: List<String>, selectedOption: String, onOptionSelect
         }
     }
 }
+
